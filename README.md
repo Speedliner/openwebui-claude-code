@@ -10,7 +10,7 @@ This is an Open WebUI **Pipe** that exposes Claude Code as a selectable model. E
 - **Per-chat workspaces** — each `chat_id` gets a sandboxed working directory that persists across turns
 - **Dual auth** — bring your own Anthropic **API key** (pay-per-token) *or* a **Claude Pro/Max OAuth token** (bills against your subscription)
 - **Streaming UI** — tool calls render inline with previews; generated images/PDFs/CSVs surface as artifacts in the chat
-- **Configurable valves** — model, permission mode, tool allowlist, max turns, workspace root, setting sources (`CLAUDE.md`)
+- **Configurable valves** — model, permission mode, tool allowlist, max turns, workspace root
 
 ## Requirements
 
@@ -23,79 +23,59 @@ This is an Open WebUI **Pipe** that exposes Claude Code as a selectable model. E
 ## Installation
 
 1. In Open WebUI, go to **Workspace → Functions → +** (or **Admin Panel → Functions**).
-2. Paste the contents of [`claude_agent_pipe.py`](./claude_agent_pipe.py) into the editor.
+2. Paste the contents of [`claude_agent_pipe.py`](https://github.com/tfriedel/openwebui-claude-code/blob/main/claude_agent_pipe.py) into the editor.
 3. Save and enable the function.
 4. Open the function's **Valves** and configure auth (one of):
    - `ANTHROPIC_API_KEY` — standard pay-per-token billing
-   - `CLAUDE_CODE_OAUTH_TOKEN` — generate on a machine with a browser via `claude setup-token`; bills against your Pro/Max/Team subscription
+   - `CLAUDE_CODE_OAUTH_TOKEN` — generate via `claude setup-token`; bills against your Pro/Max/Team subscription. **Known issue:** `setup-token` has occasionally issued tokens with a restricted scope (see [anthropics/claude-code#23703](https://github.com/anthropics/claude-code/issues/23703)), causing `401 Invalid bearer token` on every request even though the token looks valid. If this happens, log in interactively instead (run `claude` with no arguments, complete the full browser OAuth flow) and persist the resulting credentials — see [Docker / persistence notes](#docker--persistence-notes) below.
 5. A new model named **Claude Code** will appear in the model picker.
 
 ## Configuration (Valves)
 
-| Valve | Default | Description |
-| --- | --- | --- |
-| `ANTHROPIC_API_KEY` | *(env)* | Anthropic API key. Falls back to the backend's env var. |
-| `CLAUDE_CODE_OAUTH_TOKEN` | *(empty)* | Claude subscription OAuth token. Takes priority over the API key when set. |
-| `MODEL` | `claude-haiku-4-5` | Claude model ID (e.g. `claude-haiku-4-5`, `claude-sonnet-4-6`, `claude-opus-4-7`). |
-| `PERMISSION_MODE` | `bypassPermissions` | `default`, `acceptEdits`, `bypassPermissions`, `plan`, or `dontAsk`. |
-| `ALLOWED_TOOLS` | `Read,Write,Edit,Bash,Glob,Grep,WebSearch,WebFetch` | Comma-separated tools auto-approved without prompting. |
-| `WORKDIR_ROOT` | `/tmp/claude-agent-pipe` | Root directory for per-chat workspaces. |
-| `MAX_TURNS` | `30` | Max agent turns per user message. `0` disables the cap. |
-| `SETTING_SOURCES` | *(empty)* | Comma-separated filesystem setting sources to load: `user`, `project`, `local`. Empty = none (isolated baseline). See below. |
-
-## Persistent context via `CLAUDE.md` (`SETTING_SOURCES`)
-
-By default the pipe passes `setting_sources=[]` to the SDK, so **no** filesystem
-settings are loaded: each chat starts from a clean baseline and does **not**
-inherit the backend user's `~/.claude/` or the workdir's `.claude/`. This is the
-safe default for shared deployments.
-
-If you run a single-user/homelab instance and want persistent environmental
-context (e.g. a host inventory or standing instructions in
-`~/.claude/CLAUDE.md`) without re-explaining it every chat, set the valve:
-
-| Value | Loads |
-| --- | --- |
-| *(empty)* | Nothing — isolated baseline (default). |
-| `user` | `~/.claude/CLAUDE.md` **and** `~/.claude/settings.json`. |
-| `user,project,local` | Above plus the workdir's `.claude/settings.json` and `.claude/settings.local.json`. |
-
-Each token maps to one source — `user` → `~/.claude/`, `project` →
-`<workdir>/.claude/settings.json`, `local` → `<workdir>/.claude/settings.local.json`.
-Unknown tokens are dropped.
-
-> [!WARNING]
-> **Settings sources load more than `CLAUDE.md`.** A loaded `settings.json` can
-> define **hooks that execute shell commands**, permission grants, env vars, and
-> MCP servers — for *every chat*, under the backend user's identity, with the
-> pipe's default `bypassPermissions` mode. Only enable `SETTING_SOURCES` on an
-> instance you fully trust and control. **Do not enable it on multi-user or
-> public deployments** — it breaks per-chat isolation and lets host config
-> influence (or run code in) every user's session. There is no way to load
-> `CLAUDE.md` *without* also loading `settings.json` from the same source; that
-> coupling is in Claude Code, not this pipe.
-
-### Does this apply to the sandboxed pipe?
-
-Not directly. [`claude_agent_pipe_sandboxed.py`](./claude_agent_pipe_sandboxed.py)
-doesn't use `setting_sources` at all — it shells the `claude` CLI inside an
-open-terminal sandbox with a **per-chat `CLAUDE_CONFIG_DIR`** that's created
-fresh each chat, so there's no host `~/.claude/` to inherit and nothing to
-disable. Persistent context there is meant to come from mechanisms already built
-for isolation:
-
-- **Workspace Model system prompt** — appended on every turn (`--append-system-prompt`); the natural place for standing instructions.
-- **Baking into the image** — skills are already vendored into the sandbox image at build time; a `CLAUDE.md` or settings can be baked the same way (under the per-chat `CLAUDE_CONFIG_DIR` layout) if you want file-based context.
-
-Because the sandbox isolates the agent and a proxy holds the credentials, the
-security tradeoff is far milder there — but the `setting_sources` valve itself
-has nothing to act on, so it's intentionally **not** added to the sandboxed pipe.
+| Valve                     | Default                                             | Description                                                                        |
+| ------------------------- | ---------------------------------------------------- | ----------------------------------------------------------------------------------- |
+| `ANTHROPIC_API_KEY`       | *(env)*                                              | Anthropic API key. Falls back to the backend's env var.                             |
+| `CLAUDE_CODE_OAUTH_TOKEN` | *(empty)*                                            | Claude subscription OAuth token. Takes priority over the API key when set.          |
+| `MODEL`                   | `claude-haiku-4-5`                                   | Claude model ID (e.g. `claude-haiku-4-5`, `claude-sonnet-4-6`, `claude-opus-4-7`).  |
+| `PERMISSION_MODE`         | `bypassPermissions`                                  | `default`, `acceptEdits`, `bypassPermissions`, `plan`, or `dontAsk`.                |
+| `ALLOWED_TOOLS`           | `Read,Write,Edit,Bash,Glob,Grep,WebSearch,WebFetch`  | Comma-separated tools auto-approved without prompting.                              |
+| `WORKDIR_ROOT`            | `/tmp/claude-agent-pipe`                             | Root directory for per-chat workspaces.                                             |
+| `MAX_TURNS`                | `30`                                                 | Max agent turns per user message. `0` disables the cap.                             |
 
 ## Auth notes
 
 When both auth methods are present, the OAuth token wins and the API key is unset before invoking the SDK so it can't override.
 
 Per Anthropic's terms: a Claude subscription is for personal use — **don't re-offer subscription auth to other end users** through a shared Open WebUI deployment. For multi-user setups, use API keys.
+
+## Docker / persistence notes
+
+If Open WebUI's backend runs in a container without a volume for `~/.claude` (and `~/.claude.json`), credentials from an interactive `claude` login are lost the next time the container is recreated (rebuild, `docker compose down`, etc.) — even though the `CLAUDE_CODE_OAUTH_TOKEN` **Valve** itself survives fine, since Valves live in Open WebUI's own database, not the container filesystem.
+
+To make an interactive login durable, mount both paths:
+
+```yaml
+services:
+  openwebui:
+    volumes:
+      - open-webui:/app/backend/data
+      - claude-code-config:/root/.claude
+      - ./claude-code-auth/.claude.json:/root/.claude.json   # pre-create as an empty file on the host
+
+volumes:
+  open-webui:
+  claude-code-config:
+```
+
+Then log in once inside the running container:
+
+```bash
+docker exec -it <container> /usr/local/lib/python3.11/site-packages/claude_agent_sdk/_bundled/claude
+```
+
+(path depends on your Python/SDK install — check with `pip show claude-agent-sdk` if it's elsewhere)
+
+With credentials persisted this way, leave the `CLAUDE_CODE_OAUTH_TOKEN` valve empty — the pipe falls back to whatever the backend environment / `~/.claude` already provides.
 
 ## License
 
