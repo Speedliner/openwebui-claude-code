@@ -2,7 +2,8 @@
 title: Claude Code
 description: Run Claude Code's agent loop from inside OpenWebUI chats via the Claude Agent SDK.
 author: Thomas Friedel
-version: 0.1
+contributors: Speedliner
+version: 0.2
 license: MIT
 requirements: claude-agent-sdk>=0.1.60, anthropic>=0.40.0
 """
@@ -379,7 +380,7 @@ def _build_kb_mcp_server(
     that OpenWebUI's middleware already filtered by the user's grants.
     """
     if not knowledge:
-        return None, []
+        return None, [], {}
 
     collection_names = [k["id"] for k in knowledge]
     display = ", ".join(k["name"] for k in knowledge)
@@ -735,6 +736,82 @@ def _build_kb_mcp_server(
 
     server = create_sdk_mcp_server("helm-kb", "0.1", tools=tools_list)
     return server, tool_names, tools_by_name
+
+
+# ---------------------------------------------------------------------------
+# OpenWebUI Tools/MCP passthrough — wraps whatever Tools or external tool
+# servers (incl. MCP, via mcpo) are attached to the Workspace Model as an
+# in-process MCP server, so Claude Code gets the same toolbox OpenWebUI's
+# native tool-calling would use. Whatever's attached in
+# Workspace -> Models -> Tools shows up here automatically at request time —
+# no hardcoded server URL/config needed, so it stays in sync if the
+# attached tools/connections change later.
+# ---------------------------------------------------------------------------
+
+_JSON_SCHEMA_TYPE_MAP = {
+    "string": str,
+    "integer": int,
+    "number": float,
+    "boolean": bool,
+    "array": list,
+    "object": dict,
+}
+
+
+def _build_owui_tools_mcp_server(tools: Optional[Dict[str, Any]]):
+    """Wrap OpenWebUI's __tools__ (Tools + external/MCP tool servers attached
+    to the Workspace Model) as an in-process MCP server. Each entry already
+    carries an OpenAI-style JSON-schema `spec` and an async-wrapped
+    `callable` — OpenWebUI has already injected any special
+    __user__/__event_emitter__ params via apply_extra_params_to_tool_function,
+    so we just need to call it.
+
+    Note: OpenWebUI's built-in tools (web_search, image_generation,
+    execute_code) are currently NOT included in __tools__ — only
+    user-defined Tools and external/MCP tool servers are. Claude Code
+    already ships its own WebSearch/WebFetch tools, so this mainly matters
+    for custom/internal tool servers.
+    """
+    if not tools:
+        return None, []
+
+    sdk_tools = []
+    tool_names: List[str] = []
+    for name, entry in tools.items():
+        spec = entry.get("spec") or {}
+        params = spec.get("parameters", {}).get("properties", {}) or {}
+        # Flat type mapping — covers the vast majority of OpenWebUI tool
+        # specs. Nested/array-item schemas aren't modeled; extend here if a
+        # specific tool needs richer typing.
+        input_schema = {
+            pname: _JSON_SCHEMA_TYPE_MAP.get(pinfo.get("type"), str)
+            for pname, pinfo in params.items()
+        }
+        callable_fn = entry.get("callable")
+        description = spec.get("description") or f"OpenWebUI tool: {name}"
+
+        def _make_handler(fn: Callable) -> Callable:
+            async def _handler(args: Dict[str, Any]) -> Dict[str, Any]:
+                try:
+                    result = fn(**(args or {}))
+                    if asyncio.iscoroutine(result):
+                        result = await result
+                except Exception as exc:
+                    log.exception("OpenWebUI tool failed")
+                    return {
+                        "content": [{"type": "text", "text": f"Tool failed: {exc}"}]
+                    }
+                return {"content": [{"type": "text", "text": str(result)}]}
+
+            return _handler
+
+        sdk_tools.append(
+            tool(name, description, input_schema)(_make_handler(callable_fn))
+        )
+        tool_names.append(f"mcp__owui-tools__{name}")
+
+    server = create_sdk_mcp_server("owui-tools", "0.1", tools=sdk_tools)
+    return server, tool_names
 
 
 def _anthropic_kb_tool_defs(
@@ -1124,9 +1201,7 @@ class Pipe:
                     final = await stream.get_final_message()
             except Exception as exc:
                 log.exception("Fast path failed")
-                yield (
-                    f"\n\n**Fast-path error:** `{type(exc).__name__}: {exc}`\n"
-                )
+                yield (f"\n\n**Fast-path error:** `{type(exc).__name__}: {exc}`\n")
                 return
 
             if final.stop_reason != "tool_use":
@@ -1370,6 +1445,7 @@ class Pipe:
         __files__: Optional[List[Dict[str, Any]]] = None,
         __user__: Optional[Dict[str, Any]] = None,
         __metadata__: Optional[Dict[str, Any]] = None,
+        __tools__: Optional[Dict[str, Any]] = None,
     ) -> AsyncGenerator[str, None]:
         # Auth selection:
         #   1. If CLAUDE_CODE_OAUTH_TOKEN valve is set → use subscription.
@@ -1415,7 +1491,12 @@ class Pipe:
             user_dict=__user__,
             event_emitter=__event_emitter__,
         )
-        allowed_tools = allowed_tools + kb_tool_names
+
+        # OpenWebUI Tools / external tool servers (incl. MCP via mcpo)
+        # attached to the Workspace Model → same passthrough treatment.
+        owui_server, owui_tool_names = _build_owui_tools_mcp_server(__tools__)
+
+        allowed_tools = allowed_tools + kb_tool_names + owui_tool_names
 
         options_kwargs: Dict[str, Any] = {
             "cwd": str(workdir),
@@ -1435,8 +1516,14 @@ class Pipe:
             options_kwargs["resume"] = resume_id
         if self.valves.MAX_TURNS:
             options_kwargs["max_turns"] = self.valves.MAX_TURNS
+
+        mcp_servers: Dict[str, Any] = {}
         if kb_server is not None:
-            options_kwargs["mcp_servers"] = {"helm-kb": kb_server}
+            mcp_servers["helm-kb"] = kb_server
+        if owui_server is not None:
+            mcp_servers["owui-tools"] = owui_server
+        if mcp_servers:
+            options_kwargs["mcp_servers"] = mcp_servers
 
         # Extend Claude Code's default agent-loop system prompt with whatever
         # the Workspace Model configured. `append` keeps the agentic prompt
